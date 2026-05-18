@@ -20,10 +20,17 @@ const port = Number(process.env.PORT || 3000);
 const host = process.env.HOST || "127.0.0.1";
 const functionCache = new Map();
 const middlewareCache = new Map();
+const imageResponseCache = new Map();
+const imageCacheMaxBytes = 50 * 1024 * 1024;
+const imageCacheMaxEntries = 256;
+let imageCacheBytes = 0;
 let functionRouteMap;
+let photonModulePromise;
+let photonUnavailableReason;
 
 const contentTypes = {
   ".avif": "image/avif",
+  ".bmp": "image/bmp",
   ".body": "application/octet-stream",
   ".css": "text/css; charset=utf-8",
   ".gif": "image/gif",
@@ -41,6 +48,9 @@ const contentTypes = {
   ".wasm": "application/wasm",
   ".webp": "image/webp",
 };
+
+const imageConfig = config.images || {};
+const resizableImageTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 function normalizeRequestPath(value) {
   let pathname = value || "/";
@@ -96,6 +106,11 @@ function setHeaders(res, headers = {}) {
       res.setHeader(key, String(value));
     }
   }
+}
+
+function sendText(res, statusCode, message) {
+  res.writeHead(statusCode, { "content-type": "text/plain; charset=utf-8" });
+  res.end(`${message}\n`);
 }
 
 async function sendFile(req, res, filePath, statusCode = 200, headers = {}) {
@@ -346,6 +361,373 @@ function splitAbsoluteDest(dest) {
   };
 }
 
+function parseLeadingInt(value) {
+  const match = String(value || "").match(/^\d+/);
+  return match ? Number(match[0]) : null;
+}
+
+function normalizeContentType(value) {
+  return String(value || "").split(";")[0].trim().toLowerCase();
+}
+
+function contentTypeForPath(sourcePath, fallback = "application/octet-stream") {
+  const explicitType = normalizeContentType(fallback);
+  if (explicitType && explicitType !== "application/octet-stream") {
+    return explicitType;
+  }
+  return contentTypes[path.extname(sourcePath)] || fallback;
+}
+
+function imageResponseHeaders(sourcePath, contentType) {
+  const normalizedContentType = normalizeContentType(contentType);
+  const headers = {
+    "cache-control": `public, max-age=${imageConfig.minimumCacheTTL || 60}, must-revalidate`,
+    vary: "Accept",
+  };
+
+  if (normalizedContentType === "image/svg+xml" && imageConfig.contentSecurityPolicy) {
+    headers["content-security-policy"] = imageConfig.contentSecurityPolicy;
+  }
+
+  if (imageConfig.contentDispositionType) {
+    const filename = path.basename(sourcePath || "image");
+    headers["content-disposition"] = `${imageConfig.contentDispositionType}; filename="${filename}"`;
+  }
+
+  return headers;
+}
+
+function imageConfigAllowsWebp() {
+  return (imageConfig.formats || []).includes("image/webp");
+}
+
+function requestAcceptsWebp(req) {
+  const accept = String(req.headers.accept || "");
+  return accept.includes("image/webp") || accept.includes("*/*");
+}
+
+function selectOutputContentType(req, sourceContentType) {
+  const normalizedContentType = normalizeContentType(sourceContentType);
+  if (requestAcceptsWebp(req) && imageConfigAllowsWebp()) {
+    return "image/webp";
+  }
+  if (normalizedContentType === "image/jpeg") {
+    return "image/jpeg";
+  }
+  return "image/png";
+}
+
+function isAllowedImageWidth(width) {
+  const sizes = imageConfig.sizes || [];
+  return sizes.length === 0 || sizes.includes(width);
+}
+
+function isAllowedRemoteImageUrl(sourceUrl) {
+  for (const domain of imageConfig.domains || []) {
+    if (sourceUrl.hostname === domain) {
+      return true;
+    }
+  }
+
+  for (const pattern of imageConfig.remotePatterns || []) {
+    if (pattern.protocol && pattern.protocol !== sourceUrl.protocol.replace(/:$/, "")) {
+      continue;
+    }
+    if (pattern.port !== undefined && pattern.port !== "" && pattern.port !== sourceUrl.port) {
+      continue;
+    }
+    if (pattern.port === "" && sourceUrl.port) {
+      continue;
+    }
+    if (pattern.hostname && !new RegExp(pattern.hostname).test(sourceUrl.hostname)) {
+      continue;
+    }
+    if (pattern.pathname && !new RegExp(pattern.pathname).test(sourceUrl.pathname)) {
+      continue;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function localImagePath(sourcePathname) {
+  const normalized = normalizeRequestPath(sourcePathname);
+  if (normalized === "/_next/image") {
+    return null;
+  }
+  return safeJoin(staticRoot, normalized);
+}
+
+function cacheEntrySize(entry) {
+  return entry.body.length;
+}
+
+function getCachedImageResponse(cacheKey) {
+  const entry = imageResponseCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+
+  imageResponseCache.delete(cacheKey);
+  imageResponseCache.set(cacheKey, entry);
+  return entry;
+}
+
+function setCachedImageResponse(cacheKey, entry) {
+  const entrySize = cacheEntrySize(entry);
+  if (entrySize > imageCacheMaxBytes) {
+    return;
+  }
+
+  const existing = imageResponseCache.get(cacheKey);
+  if (existing) {
+    imageCacheBytes -= cacheEntrySize(existing);
+    imageResponseCache.delete(cacheKey);
+  }
+
+  imageResponseCache.set(cacheKey, entry);
+  imageCacheBytes += entrySize;
+
+  while (imageResponseCache.size > imageCacheMaxEntries || imageCacheBytes > imageCacheMaxBytes) {
+    const oldestKey = imageResponseCache.keys().next().value;
+    if (oldestKey === undefined) {
+      break;
+    }
+    const oldestEntry = imageResponseCache.get(oldestKey);
+    imageResponseCache.delete(oldestKey);
+    imageCacheBytes -= cacheEntrySize(oldestEntry);
+  }
+}
+
+function imageCacheKey(source, width, quality, outputContentType) {
+  return [
+    source.identity,
+    `width=${width}`,
+    `quality=${quality}`,
+    `format=${outputContentType}`,
+  ].join("\n");
+}
+
+async function sendImageResponse(req, res, entry) {
+  res.writeHead(200, {
+    "content-type": entry.contentType,
+    "content-length": entry.body.length,
+    ...entry.headers,
+  });
+  if (req.method === "HEAD") {
+    res.end();
+  } else {
+    res.end(entry.body);
+  }
+}
+
+function originalImageResponse(source) {
+  return {
+    body: source.body,
+    contentType: source.contentType,
+    headers: imageResponseHeaders(source.label, source.contentType),
+  };
+}
+
+async function loadPhotonModule() {
+  if (typeof WebAssembly === "undefined") {
+    return null;
+  }
+  if (photonUnavailableReason) {
+    return null;
+  }
+  if (!photonModulePromise) {
+    photonModulePromise = import("@cf-wasm/photon/node").catch((error) => {
+      photonUnavailableReason = error;
+      return null;
+    });
+  }
+  return photonModulePromise;
+}
+
+function shouldResizeImage(sourceContentType) {
+  return resizableImageTypes.has(normalizeContentType(sourceContentType));
+}
+
+function encodePhotonImage(image, contentType, quality) {
+  if (contentType === "image/webp") {
+    return Buffer.from(image.get_bytes_webp());
+  }
+  if (contentType === "image/jpeg") {
+    return Buffer.from(image.get_bytes_jpeg(quality));
+  }
+  return Buffer.from(image.get_bytes());
+}
+
+async function resizeImage(source, width, quality, outputContentType) {
+  if (!shouldResizeImage(source.contentType)) {
+    return originalImageResponse(source);
+  }
+
+  const photon = await loadPhotonModule();
+  if (!photon) {
+    return originalImageResponse(source);
+  }
+
+  let inputImage;
+  let outputImage;
+  try {
+    inputImage = photon.PhotonImage.new_from_byteslice(
+      new Uint8Array(source.body.buffer, source.body.byteOffset, source.body.byteLength)
+    );
+    const sourceWidth = inputImage.get_width();
+    const sourceHeight = inputImage.get_height();
+    if (!sourceWidth || !sourceHeight) {
+      return originalImageResponse(source);
+    }
+
+    const targetHeight = Math.max(1, Math.round((sourceHeight * width) / sourceWidth));
+    outputImage = photon.resize(
+      inputImage,
+      width,
+      targetHeight,
+      photon.SamplingFilter.Lanczos3
+    );
+
+    const body = encodePhotonImage(outputImage, outputContentType, quality);
+    return {
+      body,
+      contentType: outputContentType,
+      headers: imageResponseHeaders(source.label, outputContentType),
+    };
+  } catch {
+    return originalImageResponse(source);
+  } finally {
+    if (outputImage) {
+      outputImage.free();
+    }
+    if (inputImage) {
+      inputImage.free();
+    }
+  }
+}
+
+async function serveImageSource(req, res, source, width, quality) {
+  const normalizedContentType = normalizeContentType(source.contentType);
+  if (normalizedContentType === "image/svg+xml" && !imageConfig.dangerouslyAllowSVG) {
+    sendText(res, 400, "SVG image responses are not allowed by this image configuration");
+    return true;
+  }
+
+  const outputContentType = shouldResizeImage(source.contentType)
+    ? selectOutputContentType(req, source.contentType)
+    : source.contentType;
+  const cacheKey = imageCacheKey(source, width, quality, outputContentType);
+  const cached = getCachedImageResponse(cacheKey);
+  if (cached) {
+    await sendImageResponse(req, res, cached);
+    return true;
+  }
+
+  const response = shouldResizeImage(source.contentType)
+    ? await resizeImage(source, width, quality, outputContentType)
+    : originalImageResponse(source);
+  setCachedImageResponse(cacheKey, response);
+  await sendImageResponse(req, res, response);
+  return true;
+}
+
+async function serveLocalImage(req, res, sourcePathname, width, quality) {
+  const filePath = localImagePath(sourcePathname);
+  if (!filePath || !fileExists(filePath)) {
+    sendText(res, 404, "Image source not found");
+    return true;
+  }
+
+  const stat = await fsp.stat(filePath);
+  const contentType = contentTypeForPath(filePath);
+  const body = await fsp.readFile(filePath);
+  await serveImageSource(
+    req,
+    res,
+    {
+      body,
+      contentType,
+      identity: `local:${filePath}:${stat.mtimeMs}:${stat.size}`,
+      label: filePath,
+    },
+    width,
+    quality
+  );
+  return true;
+}
+
+async function serveRemoteImage(req, res, sourceUrl, width, quality) {
+  if (!isAllowedRemoteImageUrl(sourceUrl)) {
+    sendText(res, 400, "Remote image source is not allowed by this image configuration");
+    return true;
+  }
+
+  const upstream = await fetch(sourceUrl);
+  if (!upstream.ok) {
+    sendText(res, upstream.status, `Image source returned ${upstream.status}`);
+    return true;
+  }
+
+  const contentType = contentTypeForPath(
+    sourceUrl.pathname,
+    upstream.headers.get("content-type") || "application/octet-stream"
+  );
+  const body = Buffer.from(await upstream.arrayBuffer());
+  await serveImageSource(
+    req,
+    res,
+    {
+      body,
+      contentType,
+      identity: `remote:${sourceUrl.href}`,
+      label: sourceUrl.pathname,
+    },
+    width,
+    quality
+  );
+  return true;
+}
+
+async function serveNextImage(req, res, requestUrl) {
+  const source = requestUrl.searchParams.get("url");
+  const width = parseLeadingInt(requestUrl.searchParams.get("w"));
+  const quality = parseLeadingInt(requestUrl.searchParams.get("q") || "75");
+
+  if (!source) {
+    sendText(res, 400, "Missing image url parameter");
+    return true;
+  }
+  if (!width || !isAllowedImageWidth(width)) {
+    sendText(res, 400, "Invalid image width");
+    return true;
+  }
+  if (!quality || quality < 1 || quality > 100) {
+    sendText(res, 400, "Invalid image quality");
+    return true;
+  }
+
+  if (source.startsWith("/") && !source.startsWith("//")) {
+    return serveLocalImage(req, res, source, width, quality);
+  }
+
+  let sourceUrl;
+  try {
+    sourceUrl = new URL(source);
+  } catch {
+    sendText(res, 400, "Invalid image url parameter");
+    return true;
+  }
+
+  const requestHost = requestUrl.host;
+  if (sourceUrl.host === requestHost) {
+    return serveLocalImage(req, res, sourceUrl.pathname, width, quality);
+  }
+
+  return serveRemoteImage(req, res, sourceUrl, width, quality);
+}
+
 function toWebHeaders(headers) {
   const result = new Headers();
   for (const [key, value] of Object.entries(headers || {})) {
@@ -582,6 +964,11 @@ async function handleRequest(req, res) {
   let search = url.search;
   let statusCode = 200;
   const accumulatedHeaders = {};
+
+  if (pathname === "/_next/image") {
+    await serveNextImage(req, res, url);
+    return;
+  }
 
   for (const route of config.routes || []) {
     if (route.handle === "filesystem") {
