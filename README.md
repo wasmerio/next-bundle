@@ -60,6 +60,11 @@ the local runtime packages needed by `next-bundle`. The function directories
 reuse this shared `node_modules` through Node's normal module resolution instead
 of carrying duplicated dependency copies.
 
+`next-bundle` also preserves node_modules symlinks whose targets were
+materialized into the output. For example, if traced files are copied under
+`node_modules/.pnpm/next@.../node_modules/next`, the output includes the matching
+`node_modules/next` symlink when the source install has one.
+
 Set `PORT` to choose a port:
 
 ```sh

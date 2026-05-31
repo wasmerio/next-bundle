@@ -212,6 +212,121 @@ async function copyFileOnce(sourcePath, targetPath, copyState) {
   return true;
 }
 
+async function copySymlinkOnce(linkTarget, targetPath, copyState) {
+  const targetKey = path.resolve(targetPath);
+  if (copyState.copiedTargets.has(targetKey)) {
+    return false;
+  }
+
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  try {
+    await fs.symlink(linkTarget, targetPath);
+  } catch (error) {
+    if (!error || error.code !== "EEXIST") {
+      throw error;
+    }
+    return false;
+  }
+  copyState.copiedTargets.add(targetKey);
+  return true;
+}
+
+async function copyExistingFile(sourcePath, targetPath, copyState, sourceLabel) {
+  let sourceStat;
+  try {
+    sourceStat = await fs.lstat(sourcePath);
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      throw new Error(`${sourceLabel} references a missing file: ${sourcePath}`);
+    }
+    throw error;
+  }
+
+  if (!sourceStat.isFile()) {
+    return false;
+  }
+
+  return copyFileOnce(sourcePath, targetPath, copyState);
+}
+
+function isInsideOrSame(root, target) {
+  const relative = path.relative(root, target);
+  return !relative || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function addCoveredNodeModulesPath(rootNodeModules, sourcePath, copyState) {
+  const resolvedPath = path.resolve(sourcePath);
+  if (!isInsideOrSame(rootNodeModules, resolvedPath)) {
+    return;
+  }
+
+  copyState.coveredNodeModulesPaths.add(resolvedPath);
+  let dirPath = path.dirname(resolvedPath);
+  while (isInsideOrSame(rootNodeModules, dirPath)) {
+    copyState.coveredNodeModulesPaths.add(dirPath);
+    copyState.coveredNodeModulesDirs.add(dirPath);
+    if (path.resolve(dirPath) === path.resolve(rootNodeModules)) {
+      break;
+    }
+    dirPath = path.dirname(dirPath);
+  }
+}
+
+async function materializeCoveredNodeModulesSymlinks(
+  projectRoot,
+  outputDir,
+  copyState
+) {
+  const rootNodeModules = path.join(projectRoot, "node_modules");
+  const outputNodeModules = path.join(outputDir, "node_modules");
+  let copied = 0;
+
+  for (const sourceDir of [...copyState.coveredNodeModulesDirs].sort()) {
+    let entries;
+    try {
+      entries = await fs.readdir(sourceDir, { withFileTypes: true });
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        continue;
+      }
+      throw error;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isSymbolicLink()) {
+        continue;
+      }
+
+      const sourceLinkPath = path.join(sourceDir, entry.name);
+      const linkTarget = await fs.readlink(sourceLinkPath);
+      const sourceTargetPath = path.resolve(sourceDir, linkTarget);
+      if (!copyState.coveredNodeModulesPaths.has(sourceTargetPath)) {
+        continue;
+      }
+
+      const outputLinkPath = path.join(
+        outputNodeModules,
+        path.relative(rootNodeModules, sourceLinkPath)
+      );
+      const outputTargetPath = path.join(
+        outputNodeModules,
+        path.relative(rootNodeModules, sourceTargetPath)
+      );
+      assertInside(outputNodeModules, outputLinkPath);
+      assertInside(outputNodeModules, outputTargetPath);
+
+      const outputLinkTarget = path.isAbsolute(linkTarget)
+        ? path.relative(path.dirname(outputLinkPath), outputTargetPath) || "."
+        : linkTarget;
+      if (await copySymlinkOnce(outputLinkTarget, outputLinkPath, copyState)) {
+        copied += 1;
+      }
+    }
+  }
+
+  return copied;
+}
+
 async function findFiles(root, fileName) {
   const results = [];
 
@@ -238,24 +353,6 @@ async function findFiles(root, fileName) {
 
   await walk(root);
   return results;
-}
-
-async function copyExistingFile(sourcePath, targetPath, copyState, sourceLabel) {
-  let sourceStat;
-  try {
-    sourceStat = await fs.stat(sourcePath);
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      throw new Error(`${sourceLabel} references a missing file: ${sourcePath}`);
-    }
-    throw error;
-  }
-
-  if (!sourceStat.isFile()) {
-    return false;
-  }
-
-  return copyFileOnce(sourcePath, targetPath, copyState);
 }
 
 async function countFiles(root) {
@@ -332,8 +429,16 @@ async function materializeNextServerNodeModulesTrace(projectRoot, outputDir, cop
     const targetPath = path.join(outputNodeModules, nodeModulesRelativePath);
     assertInside(outputNodeModules, targetPath);
 
-    if (await copyExistingFile(sourcePath, targetPath, copyState, "Next server trace")) {
+    if (
+      await copyExistingFile(
+        sourcePath,
+        targetPath,
+        copyState,
+        "Next server trace"
+      )
+    ) {
       copied += 1;
+      addCoveredNodeModulesPath(rootNodeModules, sourcePath, copyState);
     }
   }
 
@@ -344,6 +449,7 @@ async function materializeFunctionFilePathMaps(projectRoot, outputDir, copyState
   const functionsRoot = path.join(outputDir, "functions");
   const outputNodeModules = path.join(outputDir, "node_modules");
   const configPaths = await findFiles(functionsRoot, ".vc-config.json");
+  const rootNodeModules = path.join(projectRoot, "node_modules");
   let functionFiles = 0;
   let sharedNodeModuleFiles = 0;
   let removedFunctionNodeModules = 0;
@@ -353,20 +459,33 @@ async function materializeFunctionFilePathMaps(projectRoot, outputDir, copyState
     const vcConfig = await readJsonIfExists(configPath);
     const filePathMap = vcConfig?.filePathMap || {};
 
-    for (const [sourceRelativePath, targetRelativePath] of Object.entries(filePathMap)) {
+    for (const [sourceRelativePath, targetRelativePath] of Object.entries(
+      filePathMap
+    )) {
       const sourcePath = path.resolve(projectRoot, sourceRelativePath);
       const nodeModulesTarget = stripTopLevelNodeModules(targetRelativePath);
       const targetPath =
         nodeModulesTarget === null
           ? path.resolve(functionDir, targetRelativePath)
           : path.resolve(outputNodeModules, nodeModulesTarget);
-      assertInside(nodeModulesTarget === null ? functionDir : outputNodeModules, targetPath);
+      assertInside(
+        nodeModulesTarget === null ? functionDir : outputNodeModules,
+        targetPath
+      );
 
-      if (await copyExistingFile(sourcePath, targetPath, copyState, "Function file map")) {
+      if (
+        await copyExistingFile(
+          sourcePath,
+          targetPath,
+          copyState,
+          "Function file map"
+        )
+      ) {
         if (nodeModulesTarget === null) {
           functionFiles += 1;
         } else {
           sharedNodeModuleFiles += 1;
+          addCoveredNodeModulesPath(rootNodeModules, sourcePath, copyState);
         }
       }
     }
@@ -501,6 +620,8 @@ async function main() {
 
   const copyState = {
     copiedTargets: new Set(),
+    coveredNodeModulesDirs: new Set(),
+    coveredNodeModulesPaths: new Set(),
   };
   const tracedNodeModuleFiles = await materializeNextServerNodeModulesTrace(
     projectRoot,
@@ -508,6 +629,11 @@ async function main() {
     copyState
   );
   const materializedFiles = await materializeFunctionFilePathMaps(
+    projectRoot,
+    outputDir,
+    copyState
+  );
+  const linkedNodeModulesSymlinks = await materializeCoveredNodeModulesSymlinks(
     projectRoot,
     outputDir,
     copyState
@@ -531,6 +657,7 @@ async function main() {
       trace: ".next/next-server.js.nft.json",
       tracedFiles: tracedNodeModuleFiles,
       functionFileMapFiles: materializedFiles.sharedNodeModuleFiles,
+      linkedSymlinks: linkedNodeModulesSymlinks,
     },
     localRuntimePackages: runtimePackages.packages,
   });
@@ -547,6 +674,13 @@ async function main() {
   console.log(
     `Materialized ${materializedFiles.functionFiles} function files and ${materializedFiles.sharedNodeModuleFiles} shared dependency files`
   );
+  if (linkedNodeModulesSymlinks > 0) {
+    console.log(
+      `Materialized ${linkedNodeModulesSymlinks} linked node_modules symlink${
+        linkedNodeModulesSymlinks === 1 ? "" : "s"
+      }`
+    );
+  }
   console.log(`Materialized ${runtimePackages.files} local runtime package files`);
   if (materializedFiles.removedFunctionNodeModules) {
     console.log(
