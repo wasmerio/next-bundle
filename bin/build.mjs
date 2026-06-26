@@ -459,14 +459,14 @@ async function materializeFunctionFilePathMaps(projectRoot, outputDir, copyState
     const vcConfig = await readJsonIfExists(configPath);
     const filePathMap = vcConfig?.filePathMap || {};
 
-    for (const [sourceRelativePath, targetRelativePath] of Object.entries(
+    for (const [bundleRelativePath, sourceRelativePath] of Object.entries(
       filePathMap
     )) {
       const sourcePath = path.resolve(projectRoot, sourceRelativePath);
-      const nodeModulesTarget = stripTopLevelNodeModules(targetRelativePath);
+      const nodeModulesTarget = stripTopLevelNodeModules(bundleRelativePath);
       const targetPath =
         nodeModulesTarget === null
-          ? path.resolve(functionDir, targetRelativePath)
+          ? path.resolve(functionDir, bundleRelativePath)
           : path.resolve(outputNodeModules, nodeModulesTarget);
       assertInside(
         nodeModulesTarget === null ? functionDir : outputNodeModules,

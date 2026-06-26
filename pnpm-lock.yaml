@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@cf-wasm/internals':
+        specifier: 0.1.2
+        version: 0.1.2
       '@cf-wasm/photon':
         specifier: 0.3.5
         version: 0.3.5
